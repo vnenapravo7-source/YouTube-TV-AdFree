@@ -1,41 +1,33 @@
-# YouTube TV AdFree — Android TV
+# YouTube 7M — Android TV
 
-Модифицированная сборка [chattytoaster/yttvaf](https://github.com/chattytoaster/yttvaf) на базе **YouTube TV 7.12.300**.
-
-![Android TV](https://img.shields.io/badge/Android_TV-7.0%2B-3DDC84?logo=android&logoColor=white)
-![ABI](https://img.shields.io/badge/ABI-armeabi--v7a-blue)
-![Package](https://img.shields.io/badge/package-com.chatty7.yttvaf-orange)
+Три сборки на базе **YouTube TV 7.12.300** и [yttvaf](https://github.com/chattytoaster/yttvaf). Реклама отключена; **SponsorBlock работает без прокси**. Для `armeabi-v7a`, Android 7.0+.
 
 ## Скачать
 
-| Версия | Статус | Описание |
-|---|---|---|
-| **[fixed8](https://github.com/vnenapravo7-source/yttvaf/releases/tag/fixed8)** | ✅ Стабильная | Рекомендуемая версия |
-| **[fixed13](https://github.com/vnenapravo7-source/yttvaf/releases/tag/fixed13)** | 🧪 Тестовая | Зелёные отметки рекламных сегментов на шкале воспроизведения |
+| Сборка | Возможности | APK |
+| --- | --- | --- |
+| **YouTube 7M** | Стабильная версия | [Скачать](https://github.com/vnenapravo7-source/YouTube-TV-AdFree/releases/latest/download/YouTubeTV-Mod-Main.apk) |
+| **YouTube 7M+** | 7M + зелёные отметки SponsorBlock на шкале видео | [Скачать](https://github.com/vnenapravo7-source/YouTube-TV-AdFree/releases/latest/download/YouTubeTV-Mod-Main-Plus.apk) |
+| **YouTube 7M v2** | 7M+ + перевод видео через Яндекс VOT | [Скачать](https://github.com/vnenapravo7-source/YouTube-TV-AdFree/releases/latest/download/YouTubeTV-Mod-V2.apk) |
 
-> В `fixed13` возможны визуальные дефекты подсветки сегментов. Во время тестирования они не обнаружены.
+[Что нового и ограничения V2 →](https://github.com/vnenapravo7-source/YouTube-TV-AdFree/releases/latest)
 
-## Что исправлено относительно исходного репозитория
+У сборок разные иконки и пакеты Android: они устанавливаются **рядом друг с другом и с обычным YouTube**. При переходе со старой сборки с другим пакетом потребуется войти в аккаунт заново.
 
-- SponsorBlock работает **без включённого прокси**.
-- Сохранена работа SponsorBlock при использовании SOCKS5-прокси.
-- Убрано мигающее уведомление с адресом веб-настроек.
-- Исправлены запуск приложения и упаковка APK для Android 11+.
-- Пакет изменён на `com.chatty7.yttvaf`.
-- В `fixed13` добавлены зелёные маркеры SponsorBlock на штатной шкале времени.
+## Перевод в V2
 
-Остальные возможности исходного мода сохранены: блокировка рекламы, веб-настройки на порту `8888`, выбор категорий SponsorBlock, качества и скорости воспроизведения.
+Нажмите **i** на пульте. Переключатель «Автоперевод» запускает перевод подходящих англоязычных роликов при воспроизведении; в выключенном положении используйте «Перевести видео» для текущего ролика. Громкость оригинала и перевода регулируется кнопками **← / →**. После перемотки с выключенным автопереводом ручной запуск может потребоваться снова. «Живой голос» пока недоступен — работает обычный голос Яндекса.
 
-## Установка
+## Установка через ADB
 
 ```powershell
-adb connect <IP_ТЕЛЕВИЗОРА>:5555
-adb install -r YouTubeTV-Mod-com.chatty7.yttvaf-fixed8.apk
-adb shell monkey -p com.chatty7.yttvaf 1
+$adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
+& $adb connect <IP_ТЕЛЕВИЗОРА>:5555
+& $adb install -r "YouTubeTV-Mod-Main.apk"
+& $adb install -r "YouTubeTV-Mod-Main-Plus.apk"
+& $adb install -r "YouTubeTV-Mod-V2.apk"
 ```
 
-Для тестовой версии замените имя APK на `YouTubeTV-Mod-com.chatty7.yttvaf-fixed13.apk`.
+Указывайте путь к скачанным APK. Можно установить все три или только нужную сборку.
 
----
-
-Проект предназначен для личного и исследовательского использования. YouTube является товарным знаком Google LLC.
+Проект не связан с Google или Яндексом. YouTube — товарный знак Google LLC.
