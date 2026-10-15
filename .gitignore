@@ -2,18 +2,15 @@
 *.apk
 *.idsig
 *.class
-scratch/bin/
-scratch/dex/
-scratch/test_out/
+.build/
 work/
+outputs/
 
 # Temporary files and logs
 *.png
 *.log
 *.tmp
-scratch/test.txt
-scratch/*.js
-scratch/*.html
+*.bak
 
 # OS files
 .DS_Store

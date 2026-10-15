@@ -31,3 +31,5 @@ $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 Указывайте путь к скачанным APK. Можно установить все три или только нужную сборку.
 
 Проект не связан с Google или Яндексом. YouTube — товарный знак Google LLC.
+
+Исходный код модулей находится в [`src/`](src), инструкция по сборке и переносу — в [`UPDATING.md`](UPDATING.md).

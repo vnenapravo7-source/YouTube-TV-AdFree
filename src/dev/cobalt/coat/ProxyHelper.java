@@ -13,9 +13,11 @@ import android.os.Process;
 import android.text.InputType;
 import android.util.Log;
 import android.view.KeyEvent;
+import android.view.View;
 import android.view.ViewGroup;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ListView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -62,6 +64,11 @@ public class ProxyHelper {
     public static final String KEY_PREFERRED_QUALITY = "preferred_quality";
     public static final String KEY_PLAYBACK_SPEED = "playback_speed";
     public static final String KEY_COLOR_KEYS_ENABLED = "color_keys_enabled";
+    public static final String KEY_VOT_ENABLED = "vot_enabled";
+    public static final String KEY_VOT_TRANSLATION_VOLUME = "vot_translation_volume";
+    public static final String KEY_VOT_ORIGINAL_VOLUME = "vot_original_volume";
+    public static final String KEY_VOT_LIVELY = "vot_lively";
+    public static final String KEY_VOT_OAUTH_TOKEN = "vot_oauth_token";
 
     public static final String KEY_LANGUAGE = "app_language";
 
@@ -152,6 +159,42 @@ public class ProxyHelper {
     private static volatile Activity sActivity = null;
     private static volatile long sNativeWebContents = 0;
     private static volatile long sInjectedWebContentsPtr = 0;
+    private static volatile String sCapturedAudioMediaUrl = null;
+    private static volatile long sCapturedAudioMediaUrlAt = 0;
+    private static volatile int sLastObservedMediaItag = -2;
+    private static volatile long sLastObservedMediaLogAt = 0;
+    private static volatile long sLastSeekGuardSentMs = 0;
+
+    public static void captureMediaUrl(String url) {
+        if (url == null || url.indexOf("googlevideo.com/videoplayback") < 0) return;
+        try {
+            String itagRaw = extractParam(url, "itag");
+            int itag = itagRaw == null ? -1 : Integer.parseInt(itagRaw);
+            long now = System.currentTimeMillis();
+            if (itag != sLastObservedMediaItag || now - sLastObservedMediaLogAt > 30000L) {
+                sLastObservedMediaItag = itag;
+                sLastObservedMediaLogAt = now;
+                Log.i(TAG, "Native YouTube media request itag=" + itag);
+            }
+            switch (itag) {
+                case 139: case 140: case 141: case 171: case 172:
+                case 249: case 250: case 251: case 256: case 258:
+                case 325: case 328:
+                    sCapturedAudioMediaUrl = url.replaceAll("([?&])range=[^&]*&?", "$1");
+                    sCapturedAudioMediaUrlAt = System.currentTimeMillis();
+                    Log.i(TAG, "Captured native YouTube audio stream itag=" + itag);
+                    break;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Unable to classify native media URL", t);
+        }
+    }
+
+    private static String getRecentCapturedAudioUrl() {
+        return sCapturedAudioMediaUrl != null &&
+                System.currentTimeMillis() - sCapturedAudioMediaUrlAt < 15000L
+                ? sCapturedAudioMediaUrl : null;
+    }
 
     private static class LruCache<K, V> extends LinkedHashMap<K, V> {
         private final int maxEntries;
@@ -186,6 +229,9 @@ public class ProxyHelper {
     }
 
     public static void onTitleChanged(String title) {
+        if (title == null || !title.startsWith("YTTV_VOT_STATE:")) {
+            Log.i(TAG, "TITLE_CHANGED: " + title);
+        }
         if (title == null) return;
         if (title.startsWith("YTTV_VID:")) {
             try {
@@ -226,6 +272,58 @@ public class ProxyHelper {
             } catch (Throwable t) {
                 Log.e(TAG, "Error in onTitleChanged (skip toast)", t);
             }
+        } else if (title.startsWith("YTTV_VOT_STATE:")) {
+            try {
+                String[] fields = title.substring(15).split(":", 6);
+                if (fields.length >= 5) {
+                    String vid = fields[0];
+                    double pos = Double.parseDouble(fields[1]);
+                    double dur = Double.parseDouble(fields[2]);
+                    boolean paused = "1".equals(fields[3]);
+                    float rate = Float.parseFloat(fields[4]);
+                    VotManager.onPlayerState(vid, pos, dur, paused, rate, getRecentCapturedAudioUrl());
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "Malformed VOT player state", t);
+            }
+        } else if (title.startsWith("YTTV_VOT_ACTIVATE:")) {
+            try {
+                String rest = title.substring(18);
+                int colon = rest.indexOf(':');
+                String vid = colon >= 0 ? rest.substring(0, colon) : rest;
+                if (!vid.matches("[A-Za-z0-9_-]{11}")) {
+                    showNativeToast("Откройте видео, затем выберите перевод");
+                    return;
+                }
+                Context ctx = sActivity != null ? sActivity : sContext;
+                if (ctx == null) return;
+                VotManager.activateForVideo(vid);
+                showNativeToast("VOT: перевод текущего видео запущен");
+            } catch (Throwable t) {
+                Log.e(TAG, "Unable to activate VOT for current video", t);
+            }
+        } else if (title.startsWith("YTTV_VOT_TOGGLE:")) {
+            try {
+                Context ctx = sActivity != null ? sActivity : sContext;
+                if (ctx != null) {
+                    SharedPreferences prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                    boolean enabled = !prefs.getBoolean(KEY_VOT_ENABLED, false);
+                    prefs.edit().putBoolean(KEY_VOT_ENABLED, enabled).apply();
+                    VotManager.setEnabled(enabled);
+                    updateWebClientConfig(prefs);
+                    if (!enabled) evaluateJs("window.__yttv_vot_manual='';if(window.__yttv_vot_clear_status)window.__yttv_vot_clear_status();");
+                    showNativeToast("Яндекс VOT: " + (enabled ? "ВКЛ" : "ВЫКЛ"));
+                }
+            } catch (Throwable t) {
+                Log.e(TAG, "Error toggling VOT from player", t);
+            }
+        } else if (title.startsWith("YTTV_REINJECT:")) {
+            try {
+                Context ctx = sActivity != null ? sActivity : sContext;
+                if (ctx != null) evaluateJs(buildModScript(ctx));
+            } catch (Throwable t) {
+                Log.e(TAG, "Error reinjecting mod script", t);
+            }
         }
     }
 
@@ -264,9 +362,9 @@ public class ProxyHelper {
                 while (!Thread.currentThread().isInterrupted()) {
                     try {
                         Thread.sleep(2000);
-                        if (sNativeWebContents != 0) {
-                            evaluateJs("if(window.__yttv_check_video){window.__yttv_check_video();}");
-                        }
+                        if (sNativeWebContents != 0) evaluateJs(
+                                "if(window.__yttv_mod_installed){if(window.__yttv_check_video)window.__yttv_check_video();}" +
+                                "else{document.title='YTTV_REINJECT:'+Date.now();}");
                     } catch (Throwable ignored) {}
                 }
             }
@@ -283,6 +381,16 @@ public class ProxyHelper {
         try {
             startWebServer(sContext);
         } catch(Throwable ignored) {}
+        try {
+            auo cl = auo.a;
+            if (cl != null) {
+                cl.c("disable-web-security", null);
+                cl.c("allow-running-insecure-content", null);
+                cl.c("unsafely-treat-insecure-origin-as-secure", "http://127.0.0.1:8888");
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to enable local SponsorBlock bridge", t);
+        }
         try {
             SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
             String proxyUrl = prefs.getString(KEY_PROXY_URL, "");
@@ -345,13 +453,11 @@ public class ProxyHelper {
 
     public static void onWebContentsAvailable(long nativePtr) {
         if (nativePtr == 0) return;
+        if (nativePtr == sInjectedWebContentsPtr && sContext != null) return;
         sNativeWebContents = nativePtr;
-        if (sInjectedWebContentsPtr == nativePtr) {
-            return;
-        }
-        sInjectedWebContentsPtr = nativePtr;
         Log.i(TAG, "WebContents initialized once: " + nativePtr);
         if (sContext != null) {
+            sInjectedWebContentsPtr = nativePtr;
             try {
                 startWebServer(sContext);
             } catch(Throwable ignored) {}
@@ -981,19 +1087,14 @@ public class ProxyHelper {
         }
         @Override
         public void run() {
-            try {
-                String ip = getLocalIpAddress();
-                if (!"127.0.0.1".equals(ip) && !"0.0.0.0".equals(ip)) {
-                    boolean isRu = isRussian(context);
-                    String msg = isRu ? ("⚡ YTTV Mod: Web-настройки http://" + ip + ":" + WEB_SERVER_PORT) :
-                            ("⚡ YTTV Mod: Web settings http://" + ip + ":" + WEB_SERVER_PORT);
-                    Toast.makeText(context.getApplicationContext(), msg, Toast.LENGTH_LONG).show();
-                }
-            } catch (Throwable ignored) {}
+            // Keep the local bridge silent; it is an internal SponsorBlock transport.
         }
     }
 
     public static synchronized void startWebServer(final Context context) {
+        SharedPreferences prefs = context != null ? context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) : null;
+        VotManager.init(context, prefs != null && prefs.getBoolean(KEY_VOT_ENABLED, false));
+        configureVot(prefs);
         if (sWebServerRunning || context == null) {
             return;
         }
@@ -1003,6 +1104,15 @@ public class ProxyHelper {
         serverThread.start();
 
         new Handler(Looper.getMainLooper()).postDelayed(new WebServerNotifyRunnable(context), 3000);
+    }
+
+    private static void configureVot(SharedPreferences prefs) {
+        if (prefs == null) return;
+        VotManager.configure(
+                prefs.getInt(KEY_VOT_TRANSLATION_VOLUME, 100) / 100.0f,
+                prefs.getInt(KEY_VOT_ORIGINAL_VOLUME, 18) / 100.0f,
+                prefs.getBoolean(KEY_VOT_LIVELY, false),
+                prefs.getString(KEY_VOT_OAUTH_TOKEN, ""));
     }
 
     private static class WebServerRunnable implements Runnable {
@@ -1113,6 +1223,33 @@ public class ProxyHelper {
                 return;
             }
 
+            // Playback state bridge for the translated audio player.
+            if (path.startsWith("/api/vot/state")) {
+                String vid = extractParam(path, "v");
+                String audioUrl = extractParam(path, "a");
+                if (audioUrl != null && !audioUrl.isEmpty()) {
+                    try { audioUrl = URLDecoder.decode(audioUrl, "UTF-8"); } catch (Throwable ignored) {}
+                }
+                if (audioUrl == null || audioUrl.isEmpty()) audioUrl = getRecentCapturedAudioUrl();
+                double pos = parseDoubleParam(path, "p", 0);
+                double dur = parseDoubleParam(path, "d", 0);
+                boolean paused = "1".equals(extractParam(path, "z"));
+                float rate = (float) parseDoubleParam(path, "r", 1);
+                VotManager.onPlayerState(vid, pos, dur, paused, rate, audioUrl);
+                byte[] b = VotManager.getStatusJson().getBytes("UTF-8");
+                String headers = "HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: application/json; charset=UTF-8\r\n" +
+                        "Access-Control-Allow-Origin: *\r\n" +
+                        "Content-Length: " + b.length + "\r\n" +
+                        "Connection: close\r\n\r\n";
+                OutputStream out = socket.getOutputStream();
+                out.write(headers.getBytes("UTF-8"));
+                out.write(b);
+                out.flush();
+                socket.close();
+                return;
+            }
+
             // Handle Config API
             if (path.startsWith("/api/config")) {
                 SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
@@ -1124,6 +1261,7 @@ public class ProxyHelper {
                 cfg.put("quality", prefs.getString(KEY_PREFERRED_QUALITY, "auto"));
                 cfg.put("speed", (double) prefs.getFloat(KEY_PLAYBACK_SPEED, 1.0f));
                 cfg.put("color_keys", prefs.getBoolean(KEY_COLOR_KEYS_ENABLED, true));
+                cfg.put("vot_enabled", prefs.getBoolean(KEY_VOT_ENABLED, false));
                 byte[] b = cfg.toString().getBytes("UTF-8");
                 String headers = "HTTP/1.1 200 OK\r\n" +
                         "Content-Type: application/json; charset=UTF-8\r\n" +
@@ -1208,6 +1346,7 @@ public class ProxyHelper {
                 float sp = 1.0f;
                 try { if (spStr != null) sp = Float.parseFloat(spStr); } catch(Exception ignored) {}
                 boolean ck = "1".equals(extractParam(payload, "color_keys_enabled"));
+                boolean vot = "1".equals(extractParam(payload, "vot_enabled"));
 
                 StringBuilder catBuilder = new StringBuilder();
                 for (String cat : ALL_SB_CATEGORIES) {
@@ -1226,11 +1365,13 @@ public class ProxyHelper {
                         .putBoolean(KEY_SB_ENABLED, sb)
                         .putString(KEY_PREFERRED_QUALITY, q)
                         .putFloat(KEY_PLAYBACK_SPEED, sp)
-                        .putBoolean(KEY_COLOR_KEYS_ENABLED, ck);
+                        .putBoolean(KEY_COLOR_KEYS_ENABLED, ck)
+                        .putBoolean(KEY_VOT_ENABLED, vot);
                 if (payload.contains("cat_") || (rawCats != null && !rawCats.isEmpty())) {
                     editor.putString(KEY_SB_CATEGORIES, newCats);
                 }
                 editor.apply();
+                VotManager.setEnabled(vot);
 
                 updateWebClientConfig(prefs);
                 responseHtml = getHtmlPage(context, isRuReq ? "✅ Настройки применены на ТВ!" : "✅ Settings applied to TV!");
@@ -1313,12 +1454,22 @@ public class ProxyHelper {
         return null;
     }
 
+    private static double parseDoubleParam(String queryOrBody, String paramName, double fallback) {
+        try {
+            String value = extractParam(queryOrBody, paramName);
+            return value == null ? fallback : Double.parseDouble(value);
+        } catch (Throwable ignored) {
+            return fallback;
+        }
+    }
+
     public static String buildModScript(Context context) {
         SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         boolean sbEnabled = prefs.getBoolean(KEY_SB_ENABLED, true);
         String sbCatsJson = getSbCategoriesJson(context);
         String quality = prefs.getString(KEY_PREFERRED_QUALITY, "auto");
         float speed = prefs.getFloat(KEY_PLAYBACK_SPEED, 1.0f);
+        boolean votEnabled = prefs.getBoolean(KEY_VOT_ENABLED, false);
         boolean isRu = isRussian(prefs);
 
         return "(function() {\n" +
@@ -1335,6 +1486,7 @@ public class ProxyHelper {
                 "                sbCategories: " + sbCatsJson + ",\n" +
                 "                quality: \"" + quality + "\",\n" +
                 "                speed: " + speed + ",\n" +
+                "                votEnabled: " + votEnabled + ",\n" +
                 "                isRu: " + isRu + "\n" +
                 "            });\n" +
                 "        }\n" +
@@ -1346,6 +1498,7 @@ public class ProxyHelper {
                 "        sbCategories: " + sbCatsJson + ",\n" +
                 "        quality: \"" + quality + "\",\n" +
                 "        speed: " + speed + ",\n" +
+                "        votEnabled: " + votEnabled + ",\n" +
                 "        isRu: " + isRu + "\n" +
                 "    };\n" +
                 "\n" +
@@ -1393,6 +1546,32 @@ public class ProxyHelper {
                 "        } catch(e) {}\n" +
                 "    }\n" +
                 "    window.__yttv_show_osd = showOsd;\n" +
+                "    var votSavedVolume = null;\n" +
+                "    var lastVotReport = 0;\n" +
+                "    window.__yttv_vot_status = function(msg, color, duration) {\n" +
+                "        try {\n" +
+                "            var el=document.getElementById('__yttv_vot_status');\n" +
+                "            if(!el){el=document.createElement('div');el.id='__yttv_vot_status';el.style.cssText='position:fixed;top:40px;right:50px;z-index:2147483647;background:#181818;border:2px solid;border-radius:10px;padding:14px 26px;font-size:24px;font-weight:bold;pointer-events:none;max-width:65vw;';(document.body||document.documentElement).appendChild(el);}\n" +
+                "            el.textContent=msg;el.style.color=color||'#00b0ff';el.style.borderColor=color||'#00b0ff';el.style.display='block';\n" +
+                "            if(el.__hideTimer)clearTimeout(el.__hideTimer);\n" +
+                "            if(msg.indexOf('перевод включён')!==-1||msg.indexOf('VOT выключен')!==-1||msg==='VOT включён')el.__hideTimer=setTimeout(function(){el.style.display='none';},Math.max(2500,duration||3000));\n" +
+                "        }catch(e){}\n" +
+                "    };\n" +
+                "    window.__yttv_vot_clear_status = function(){try{var el=document.getElementById('__yttv_vot_status');if(el){if(el.__hideTimer)clearTimeout(el.__hideTimer);el.style.display='none';}}catch(e){}};\n" +
+                "    window.__yttv_vot_set_active = function(active, originalVolume) {\n" +
+                "        try {\n" +
+                "            var p = getPlayer();\n" +
+                "            if (p && typeof p.getVolume === 'function' && typeof p.setVolume === 'function') {\n" +
+                "                if (active) {\n" +
+                "                    if (votSavedVolume === null) votSavedVolume = p.getVolume();\n" +
+                "                    var ov=Number(originalVolume);p.setVolume(Math.max(0,Math.min(100,isFinite(ov)?ov:18)));\n" +
+                "                } else if (votSavedVolume !== null) {\n" +
+                "                    p.setVolume(votSavedVolume);\n" +
+                "                    votSavedVolume = null;\n" +
+                "                }\n" +
+                "            }\n" +
+                "        } catch(e) {}\n" +
+                "    };\n" +
                 "\n" +
                 "    /* 2. AD BLOCKER */\n" +
                 "    function stripAds(o) {\n" +
@@ -1409,6 +1588,7 @@ public class ProxyHelper {
                 "            var r = origParse.apply(this, arguments);\n" +
                 "            if (r && typeof r === 'object') {\n" +
                 "                stripAds(r);\n" +
+                "                try{if(!votAudioUrl&&typeof arguments[0]==='string'&&arguments[0].indexOf('adaptiveFormats')!==-1)captureVotFormats(r);}catch(e){}\n" +
                 "            }\n" +
                 "            return r;\n" +
                 "        };\n" +
@@ -1448,9 +1628,12 @@ public class ProxyHelper {
                 "    }\n" +
                 "\n" +
                 "    /* 5. SPEED CONTROL */\n" +
-                "    function applySpeed() {\n" +
+                "    var speedLastAppliedAt=0,speedLastVideo=null,speedLastValue=1.0;\n" +
+                "    function applySpeed(force) {\n" +
                 "        try {\n" +
+                "            if(Date.now()<(window.__yttv_seek_guard_until||0))return;\n" +
                 "            var speed = parseFloat(window.__yttv_config.speed) || 1.0;\n" +
+                "            var now=Date.now();if(!force&&speed===1.0&&speedLastValue===1.0)return;if(!force&&speedLastValue===speed&&speedLastVideo===currentVid&&now-speedLastAppliedAt<10000)return;\n" +
                 "            var ad = document.querySelector('.ad-showing, .ad-interrupting, .ytp-ad-player-overlay, [class*=\"ad-showing\"]');\n" +
                 "            if (ad) return;\n" +
                 "            var vids = document.getElementsByTagName('video');\n" +
@@ -1461,6 +1644,7 @@ public class ProxyHelper {
                 "            if (p && p.getPlaybackRate && p.setPlaybackRate) {\n" +
                 "                if (p.getPlaybackRate() !== speed) p.setPlaybackRate(speed);\n" +
                 "            }\n" +
+                "            speedLastAppliedAt=now;speedLastVideo=currentVid;speedLastValue=speed;\n" +
                 "        } catch(e) {}\n" +
                 "    }\n" +
                 "\n" +
@@ -1471,6 +1655,15 @@ public class ProxyHelper {
                 "    var skippedUuids = {};\n" +
                 "    var segmentsCache = {};\n" +
                 "    var pendingFetches = {};\n" +
+                "\n" +
+                "    function fetchSponsorBlock(vid) {\n" +
+                "        try {\n" +
+                "            fetch('http://127.0.0.1:8888/api/sponsorblock?v=' + encodeURIComponent(vid), {cache:'no-store'})\n" +
+                "                .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })\n" +
+                "                .then(function(data) { window.__yttv_set_segments(vid, Array.isArray(data) ? data : []); })\n" +
+                "                .catch(function(e) { console.log('[YTTV Mod] SponsorBlock local bridge failed: ' + e); });\n" +
+                "        } catch(e) { console.log('[YTTV Mod] SponsorBlock local bridge exception: ' + e); }\n" +
+                "    }\n" +
                 "\n" +
                 "    function checkVideo() {\n" +
                 "        var p = getPlayer();\n" +
@@ -1496,12 +1689,13 @@ public class ProxyHelper {
                 "        }\n" +
                 "\n" +
                 "        var isWatch = (location.hash || location.href).indexOf('watch') !== -1;\n" +
-                "        if (!isWatch && !vid) {\n" +
+                "        if (!isWatch) {\n" +
                 "            if (currentVid !== null) {\n" +
                 "                currentVid = null;\n" +
                 "                segments = [];\n" +
                 "                rawSegments = [];\n" +
                 "                skippedUuids = {};\n" +
+                "                pendingFetches = {};\n" +
                 "            }\n" +
                 "            return;\n" +
                 "        }\n" +
@@ -1522,10 +1716,10 @@ public class ProxyHelper {
                 "                    pendingFetches[vid] = Date.now();\n" +
                 "                    segments = [];\n" +
                 "                    rawSegments = [];\n" +
-                "                    document.title = 'YTTV_VID:' + vid + ':' + Date.now();\n" +
+                "                    fetchSponsorBlock(vid);\n" +
                 "                } else if (Date.now() - pendingFetches[vid] > 5000) {\n" +
                 "                    pendingFetches[vid] = Date.now();\n" +
-                "                    document.title = 'YTTV_VID:' + vid + ':' + Date.now();\n" +
+                "                    fetchSponsorBlock(vid);\n" +
                 "                }\n" +
                 "            }\n" +
                 "        }\n" +
@@ -1565,6 +1759,7 @@ public class ProxyHelper {
                 "    };\n" +
                 "\n" +
                 "    function checkSponsorBlock(curTime) {\n" +
+                "        if(Date.now()<(window.__yttv_seek_guard_until||0))return;\n" +
                 "        if (!window.__yttv_config.sbEnabled || segments.length === 0 || curTime < 0) return;\n" +
                 "        var p = getPlayer();\n" +
                 "        for (var i = 0; i < segments.length; i++) {\n" +
@@ -1611,14 +1806,15 @@ public class ProxyHelper {
                 "    /* 7. EXPOSED CONTROLS */\n" +
                 "    window.__yttv_update_config = function(cfg) {\n" +
                 "        if (!cfg) return;\n" +
+                "        var oldSpeed=window.__yttv_config.speed,oldQuality=window.__yttv_config.quality,oldSb=window.__yttv_config.sbEnabled,oldCats=JSON.stringify(window.__yttv_config.sbCategories);\n" +
                 "        for (var k in cfg) window.__yttv_config[k] = cfg[k];\n" +
-                "        applySpeed();\n" +
-                "        applyQuality();\n" +
-                "        filterSegments();\n" +
+                "        if(Number(oldSpeed)!==Number(window.__yttv_config.speed))applySpeed(true);\n" +
+                "        if(oldQuality!==window.__yttv_config.quality)applyQuality();\n" +
+                "        if(oldSb!==window.__yttv_config.sbEnabled||oldCats!==JSON.stringify(window.__yttv_config.sbCategories))filterSegments();\n" +
                 "    };\n" +
                 "    window.__yttv_set_speed = function(val) {\n" +
                 "        window.__yttv_config.speed = val;\n" +
-                "        applySpeed();\n" +
+                "        applySpeed(true);\n" +
                 "        var isRu = window.__yttv_config && window.__yttv_config.isRu;\n" +
                 "        showOsd(isRu ? ('⚡ Скорость: ' + val + 'x') : ('⚡ Speed: ' + val + 'x'), '#00e676', 2000);\n" +
                 "    };\n" +
@@ -1636,7 +1832,92 @@ public class ProxyHelper {
                 "        var offTxt = isRu ? 'ВЫКЛ' : 'OFF';\n" +
                 "        showOsd('⏩ SponsorBlock: ' + (val ? onTxt : offTxt), val ? '#00e676' : '#ff5252', 2000);\n" +
                 "    };\n" +
+                "    window.__yttv_vot_manual='';\n" +
+                "    window.__yttv_vot_activate = function(){try{checkVideo();var watch=(location.hash||location.href).indexOf('watch')!==-1,vid=watch&&currentVid?currentVid:'';if(vid)window.__yttv_vot_manual=vid;document.title='YTTV_VOT_ACTIVATE:'+vid+':'+Date.now();}catch(e){}};\n" +
+                "    function getVotSourceLanguage(p){try{var lang='',track=p&&p.getAudioTrack&&p.getAudioTrack(),info=track&&track.getLanguageInfo&&track.getLanguageInfo();lang=info&&(info.id||info.languageCode||info.language)||'';if(!lang||/^und(?:[._-]|$)/i.test(String(lang))){var data=p&&p.getVideoData&&p.getVideoData();lang=data&&(data.audioLanguage||data.languageCode||data.language)||'';}if(!lang||/^und(?:[._-]|$)/i.test(String(lang))){var response=p&&p.getPlayerResponse&&p.getPlayerResponse(),list=response&&response.captions&&response.captions.playerCaptionsTracklistRenderer&&response.captions.playerCaptionsTracklistRenderer.captionTracks;if(list)for(var i=0;i<list.length;i++)if(list[i]&&list[i].kind==='asr'&&list[i].languageCode){lang=list[i].languageCode;break;}}var match=String(lang||'').toLowerCase().match(/^[a-z]{2,3}(?=[._-]|$)/);return match&&match[0]!=='und'?match[0]:'';}catch(e){return '';}}\n" +
+                "    function isVotLive(p){try{var data=p&&p.getVideoData&&p.getVideoData(),response=p&&p.getPlayerResponse&&p.getPlayerResponse();return !!(data&&(data.isLive||data.is_live||data.isLiveContent)||response&&response.videoDetails&&response.videoDetails.isLiveContent);}catch(e){return false;}}\n" +
                 "\n" +
+                "    var votAudioUrl = '';\n" +
+                "    function captureVotFormats(root){\n" +
+                "        try{if(root&&root.videoDetails&&root.videoDetails.videoId&&currentVid&&root.videoDetails.videoId!==currentVid)return;var queue=[{o:root,d:0}],seen=[],count=0;while(queue.length&&count++<200&&!votAudioUrl){var item=queue.shift(),o=item.o;if(!o||typeof o!=='object'||seen.indexOf(o)!==-1||item.d>6)continue;seen.push(o);var formats=o.adaptiveFormats||(o.streamingData&&o.streamingData.adaptiveFormats);if(Array.isArray(formats)){var best=null;for(var i=0;i<formats.length;i++){var f=formats[i],u=f&&f.url,mt=f&&(f.mimeType||'');if(mt.indexOf('audio/')!==0||!u||u.indexOf('googlevideo.com/videoplayback')===-1)continue;if(!best||(Number(f.bitrate)||999999)<(Number(best.bitrate)||999999))best=f;}if(best){votAudioUrl=best.url;document.title='YTTV_VOT_AUDIO_FOUND:'+Date.now();return;}}var keys=['playerResponse','player','response','data','contents','videoData','streamingData'];for(var k=0;k<keys.length;k++){var child=o[keys[k]];if(child&&typeof child==='object')queue.push({o:child,d:item.d+1});}if(Array.isArray(o))for(var j=0;j<Math.min(o.length,30);j++)if(o[j]&&typeof o[j]==='object')queue.push({o:o[j],d:item.d+1});}}catch(e){}\n" +
+                "    }\n" +
+                "    try{var originalFetch=window.fetch;if(typeof originalFetch==='function')window.fetch=function(){var args=arguments,u=String(args[0]&&args[0].url||args[0]||'');return originalFetch.apply(this,args).then(function(response){if(u.indexOf('/youtubei/v1/player')!==-1&&response&&response.clone)response.clone().json().then(captureVotFormats).catch(function(){});return response;});};}catch(e){}\n" +
+                "    var votAudioLookupVid='',votAudioLookupAt=0;\n" +
+                "    function requestVotAudioFromPlayer(vid){try{if(!vid||votAudioUrl||votAudioLookupVid===vid&&Date.now()-votAudioLookupAt<120000)return;votAudioLookupVid=vid;votAudioLookupAt=Date.now();var cfg=window.ytcfg,ctx=cfg&&cfg.get&&cfg.get('INNERTUBE_CONTEXT'),key=cfg&&cfg.get&&cfg.get('INNERTUBE_API_KEY');if(!ctx||!key){document.title='YTTV_VOT_API:config-missing:'+Date.now();return;}var client=ctx.client||{},body=JSON.stringify({context:ctx,videoId:vid,contentCheckOk:true,racyCheckOk:true});fetch('/youtubei/v1/player?key='+encodeURIComponent(key),{method:'POST',credentials:'include',headers:{'Content-Type':'application/json','X-Youtube-Client-Name':String(cfg.get('INNERTUBE_CONTEXT_CLIENT_NAME')||7),'X-Youtube-Client-Version':String(client.clientVersion||'')},body:body}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(data){captureVotFormats(data);document.title='YTTV_VOT_API:'+(votAudioUrl?'audio-found':'no-audio')+':'+Date.now();}).catch(function(e){document.title='YTTV_VOT_API:error:'+Date.now();});}catch(e){}}\n" +
+                "    function rememberVotMediaUrl(u){\n" +
+                "        try{u=String(u||'').replace(/\\u0026/g,'&');if(u.indexOf('googlevideo.com/videoplayback')===-1)return;var m=u.match(/[?&]itag=(\\d+)/),itag=m?Number(m[1]):0;var audioItags={139:1,140:1,141:1,171:1,172:1,249:1,250:1,251:1,256:1,258:1,325:1,328:1};if(audioItags[itag]||u.indexOf('mime=audio')!==-1||u.indexOf('mime%3Daudio')!==-1||u.indexOf('audio%2F')!==-1)votAudioUrl=u.replace(/([?&])range=\\d+-\\d+&?/,'$1');}catch(e){}\n" +
+                "    }\n" +
+                "    function rememberVotCandidate(s){try{s=String(s||'');var variants=[s];for(var n=0;n<2;n++){try{var d=decodeURIComponent(variants[variants.length-1]);if(d!==variants[variants.length-1])variants.push(d);}catch(e){break;}}for(var i=0;i<variants.length;i++){var x=variants[i];rememberVotMediaUrl(x);if(votAudioUrl)return;try{var q=new URLSearchParams(x.charAt(0)==='?'?x.substring(1):x),u=q.get('url');if(u){var sig=q.get('sig')||q.get('signature'),sp=q.get('sp')||'signature';if(sig&&u.indexOf(sp+'=')===-1)u+=(u.indexOf('?')<0?'?':'&')+sp+'='+encodeURIComponent(sig);rememberVotMediaUrl(u);}}catch(e){}}}catch(e){}}\n" +
+                "    try{if(window.PerformanceObserver){new PerformanceObserver(function(list){var es=list.getEntries();for(var i=0;i<es.length;i++)rememberVotMediaUrl(es[i].name);}).observe({entryTypes:['resource']});}}catch(e){}\n" +
+                "    function findVotAudioUrl(p) {\n" +
+                "        if (votAudioUrl) return votAudioUrl;\n" +
+                "        function scan(root) {\n" +
+                "            var queue = [{v:root,d:0}], seen = [];\n" +
+                "            while (queue.length) {\n" +
+                "                var item = queue.shift(), o = item.v;\n" +
+                "                if(typeof o==='string'){rememberVotCandidate(o);if(votAudioUrl)return votAudioUrl;continue;}\n" +
+                "                if (!o || typeof o !== 'object' || item.d > 8 || seen.indexOf(o) !== -1) continue;\n" +
+                "                seen.push(o);\n" +
+                "                try {\n" +
+                "                    var formats = o.adaptiveFormats || (o.streamingData && o.streamingData.adaptiveFormats);\n" +
+                "                    if (formats && formats.length) {\n" +
+                "                        var best = null;\n" +
+                "                        for (var i=0;i<formats.length;i++) {\n" +
+                "                            var f=formats[i], mt=(f.mimeType||'');\n" +
+                "                            if (mt.indexOf('audio/') !== 0) continue;if(!f.url){rememberVotCandidate(f.signatureCipher||f.cipher||'');if(votAudioUrl)return votAudioUrl;continue;}\n" +
+                "                            if (!best || (Number(f.bitrate)||999999) < (Number(best.bitrate)||999999)) best=f;\n" +
+                "                        }\n" +
+                "                        if (best && best.url) return best.url;\n" +
+                "                    }\n" +
+                "                    for (var k in o) {\n" +
+                "                        if (!Object.prototype.hasOwnProperty.call(o,k)) continue;\n" +
+                "                        var v=o[k]; if(v&&typeof v==='string'){rememberVotCandidate(v);if(votAudioUrl)return votAudioUrl;}else if(v&&typeof v==='object')queue.push({v:v,d:item.d+1});\n" +
+                "                    }\n" +
+                "                } catch(e) {}\n" +
+                "            }\n" +
+                "            return '';\n" +
+                "        }\n" +
+                "        try {\n" +
+                "            var candidates=[];\n" +
+                "            if (p && typeof p.getPlayerResponse === 'function') candidates.push(p.getPlayerResponse());\n" +
+                "            if (p && typeof p.getVideoData === 'function') candidates.push(p.getVideoData());\n" +
+                "            if (window.ytInitialPlayerResponse) candidates.push(window.ytInitialPlayerResponse);\n" +
+                "            for (var c=0;c<candidates.length;c++) {\n" +
+                "                var x=candidates[c]; if (typeof x === 'string') { try{x=JSON.parse(x);}catch(e){} }\n" +
+                "                var found=scan(x); if(found){votAudioUrl=found;return found;}\n" +
+                "            }\n" +
+                "            var entries=(performance.getEntriesByType&&performance.getEntriesByType('resource'))||[];\n" +
+                "            for(var e=entries.length-1;e>=0;e--){\n" +
+                "                rememberVotMediaUrl(entries[e].name||'');if(votAudioUrl)return votAudioUrl;\n" +
+                "            }\n" +
+                "        } catch(e) {}\n" +
+                "        return '';\n" +
+                "    }\n" +
+                "\n" +
+                "    function findProgressBarHost() {\n" +
+                "        try {\n" +
+                "            if((location.hash||location.href).indexOf('watch')===-1||!currentVid)return null;\n" +
+                "            var host=document.querySelector('.dySudf.JUdgxb')||document.querySelector('.yTWxAb')||document.querySelector('[role=slider]')||document.querySelector('.ytp-progress-bar-container');\n" +
+                "            if(!host){var ds=document.getElementsByTagName('div');for(var i=0;i<ds.length;i++){var z=ds[i].getBoundingClientRect();if(z.width>innerWidth*.7&&z.height>=2&&z.height<=30&&z.top>innerHeight*.55){host=ds[i];break;}}}\n" +
+                "            if(!host)return null; var n=host;\n" +
+                "            while(n&&n!==document.documentElement){var st=getComputedStyle(n);if(st.display==='none'||st.visibility==='hidden'||Number(st.opacity)<0.05)return null;n=n.parentElement;}\n" +
+                "            var r=host.getBoundingClientRect();\n" +
+                "            if(r.width<innerWidth*0.70||r.height<2||r.height>30||r.top<0||r.bottom>innerHeight+2)return null;\n" +
+                "            return host;\n" +
+                "        }catch(e){return null;}\n" +
+                "    }\n" +
+                "    var sbMarkerSig='',sbMarkerLast=0;\n" +
+                "    function renderSponsorMarkers(){\n" +
+                "        try {\n" +
+                "            var now=Date.now();if(now-sbMarkerLast<1000)return;sbMarkerLast=now;\n" +
+                "            var old=document.getElementById('__yttv_sb_markers'),host=findProgressBarHost();\n" +
+                "            if(!host||!segments||!segments.length){if(old)old.style.display='none';return;}\n" +
+                "            var p=getPlayer(),duration=(p&&p.getDuration&&Number(p.getDuration()))||0;if(!(duration>0))return;\n" +
+                "            var r=host.getBoundingClientRect(),root=old,sig=currentVid+':'+Math.round(duration*10)+':';for(var q=0;q<segments.length;q++)sig+=segments[q].start+'-'+segments[q].end+';';\n" +
+                "            if(!root||sig!==sbMarkerSig){if(root&&root.parentNode)root.parentNode.removeChild(root);root=document.createElement('div');root.id='__yttv_sb_markers';root.style.position='fixed';root.style.pointerEvents='none';root.style.zIndex='2147483646';root.style.overflow='hidden';for(var i=0;i<segments.length;i++){var s=segments[i],a=Math.max(0,Math.min(100,s.start*100/duration)),b=Math.max(a,Math.min(100,s.end*100/duration));if(b<=a)continue;var m=document.createElement('div');m.style.position='absolute';m.style.left=a+'%';m.style.width=(b-a)+'%';m.style.top='0';m.style.bottom='0';m.style.backgroundColor='#00d26a';m.style.opacity='0.88';root.appendChild(m);}(document.body||document.documentElement).appendChild(root);sbMarkerSig=sig;}\n" +
+                "            root.style.display='block';root.style.left=Math.round(r.left)+'px';root.style.top=Math.round(r.top)+'px';root.style.width=Math.round(r.width)+'px';root.style.height=Math.max(6,Math.min(12,Math.round(r.height)))+'px';\n" +
+                "        }catch(e){}\n" +
+                "    }\n" +
                 "    /* 8. MAIN TICKER (every 250ms) */\n" +
                 "    setInterval(function() {\n" +
                 "        try {\n" +
@@ -1657,6 +1938,34 @@ public class ProxyHelper {
                 "            }\n" +
                 "\n" +
                 "            checkVideo();\n" +
+                "            renderSponsorMarkers();\n" +
+                "            var obsoleteVotButton=document.getElementById('__yttv_vot_button');if(obsoleteVotButton&&obsoleteVotButton.parentNode)obsoleteVotButton.parentNode.removeChild(obsoleteVotButton);\n" +
+                "            var watchVid=(location.hash||location.href).indexOf('watch')!==-1?(currentVid||''):'';\n" +
+                "            if(window.__yttv_vot_seen_watch!==watchVid){window.__yttv_vot_seen_watch=watchVid;if(window.__yttv_vot_clear_status)window.__yttv_vot_clear_status();}\n" +
+                "            if(window.__yttv_vot_manual&&window.__yttv_vot_manual!==watchVid){window.__yttv_vot_manual='';document.title='YTTV_VOT_STATE::0:0:1:1:'+Date.now();}\n" +
+                "            if(!watchVid&&window.__yttv_vot_clear_status)window.__yttv_vot_clear_status();\n" +
+                "            if ((window.__yttv_config.votEnabled||window.__yttv_vot_manual===watchVid&&!!watchVid) && Date.now() - lastVotReport >= 750) {\n" +
+                "                lastVotReport = Date.now();\n" +
+                "                var votVid=watchVid,manual=!!watchVid&&window.__yttv_vot_manual===watchVid,lang=getVotSourceLanguage(p);\n" +
+                "                if(!manual&&(!lang||lang==='ru'))votVid='';\n" +
+                "                if(window.__yttv_vot_audio_vid!==votVid){window.__yttv_vot_audio_vid=votVid;votAudioUrl='';}\n" +
+                "                var vp = -1, vd = -1, vr = 1, vz = 1;\n" +
+                "                try { if (p && typeof p.getCurrentTime === 'function') vp = p.getCurrentTime(); } catch(e) {}\n" +
+                "                try { if (p && typeof p.getDuration === 'function') vd = p.getDuration(); } catch(e) {}\n" +
+                "                try { if(!(vd>0)&&p&&typeof p.getVideoData==='function'){var info=p.getVideoData();vd=Number(info&&(info.length_seconds||info.lengthSeconds||info.duration))||vd;} } catch(e) {}\n" +
+                "                try { if (p && typeof p.getPlaybackRate === 'function') vr = p.getPlaybackRate(); } catch(e) {}\n" +
+                "                try { if (p && typeof p.getPlayerState === 'function') vz = p.getPlayerState() === 1 ? 0 : 1; } catch(e) {}\n" +
+                "                if ((vp < 0 || isNaN(vp)) && vids.length > 0) vp = vids[0].currentTime;\n" +
+                "                if ((vd < 0 || isNaN(vd)) && vids.length > 0) vd = vids[0].duration;\n" +
+                "                if (vids.length > 0 && (!p || typeof p.getPlayerState !== 'function')) vz = vids[0].paused ? 1 : 0;\n" +
+                "                if(!(vd>0)||!isFinite(vd)||vd>=14400||isVotLive(p))votVid='';\n" +
+                "                if(!votVid&&window.__yttv_vot_clear_status)window.__yttv_vot_clear_status();\n" +
+                "                var langSig=watchVid+':'+(lang||'unknown')+':'+(votVid?'translate':'skip');if(window.__yttv_vot_lang_sig!==langSig){window.__yttv_vot_lang_sig=langSig;document.title='YTTV_VOT_LANG:'+langSig;}\n" +
+                "                var va = votVid ? findVotAudioUrl(p) : '';\n" +
+                "                if(!va&&votVid)requestVotAudioFromPlayer(votVid);\n" +
+                "                document.title='YTTV_VOT_STATE:'+votVid+':'+(vp||0)+':'+(vd||0)+':'+vz+':'+(vr||1)+':'+Date.now();\n" +
+                "                if(va)fetch('http://127.0.0.1:8888/api/vot/state?v='+encodeURIComponent(votVid)+'&p='+encodeURIComponent(vp||0)+'&d='+encodeURIComponent(vd||0)+'&z='+vz+'&r='+encodeURIComponent(vr||1)+'&a='+encodeURIComponent(va),{cache:'no-store'}).catch(function(){});\n" +
+                "            }\n" +
                 "\n" +
                 "            if (segments.length > 0) {\n" +
                 "                var curTime = -1;\n" +
@@ -1691,49 +2000,41 @@ public class ProxyHelper {
                         "&categories=%5B%22sponsor%22,%22selfpromo%22,%22interaction%22,%22intro%22,%22outro%22,%22preview%22,%22filler%22,%22music_offtopic%22%5D"
         };
 
-        Proxy[] proxies;
-        if (sProxyEnabled) {
-            proxies = new Proxy[]{
-                    new Proxy(Proxy.Type.SOCKS, new InetSocketAddress("127.0.0.1", LOCAL_SOCKS_PORT)),
-                    Proxy.NO_PROXY
-            };
-        } else {
-            proxies = new Proxy[]{Proxy.NO_PROXY};
-        }
-
-        boolean success = false;
-        for (Proxy proxy : proxies) {
-            if (success) break;
-            for (String urlStr : endpoints) {
-                HttpURLConnection conn = null;
-                try {
-                    URL url = new URL(urlStr);
-                    conn = (HttpURLConnection) url.openConnection(proxy);
-                    conn.setConnectTimeout(3500);
-                    conn.setReadTimeout(3500);
-                    conn.setRequestProperty("User-Agent", "Mozilla/5.0 (SmartHub; SMART-TV; U; Linux/SmartTV) AppleWebKit/538.1");
-                    int code = conn.getResponseCode();
-                    if (code == 200) {
-                        BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"));
-                        StringBuilder sb = new StringBuilder();
-                        String line;
-                        while ((line = br.readLine()) != null) {
-                            sb.append(line);
-                        }
-                        br.close();
-                        result = sb.toString();
-                        success = true;
-                        break;
-                    } else if (code == 404) {
-                        result = "[]";
-                        success = true;
-                        break;
+        // SponsorBlock is intentionally fetched directly. The proxy may be enabled
+        // for YouTube traffic, but it must never be required for this API call.
+        for (String urlStr : endpoints) {
+            HttpURLConnection conn = null;
+            try {
+                URL url = new URL(urlStr);
+                conn = (HttpURLConnection) url.openConnection(Proxy.NO_PROXY);
+                conn.setInstanceFollowRedirects(true);
+                conn.setUseCaches(false);
+                conn.setConnectTimeout(6000);
+                conn.setReadTimeout(6000);
+                conn.setRequestProperty("Accept", "application/json");
+                conn.setRequestProperty("Cache-Control", "no-cache");
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (SmartHub; SMART-TV; U; Linux/SmartTV) AppleWebKit/538.1");
+                int code = conn.getResponseCode();
+                if (code == 200) {
+                    BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"));
+                    StringBuilder sb = new StringBuilder();
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        sb.append(line);
                     }
-                } catch (Throwable ignored) {
-                } finally {
-                    if (conn != null) {
-                        try { conn.disconnect(); } catch (Throwable ignored) {}
-                    }
+                    br.close();
+                    result = sb.toString();
+                    break;
+                } else if (code == 404) {
+                    result = "[]";
+                    break;
+                }
+                Log.w(TAG, "SponsorBlock direct request returned HTTP " + code + " for " + urlStr);
+            } catch (Throwable t) {
+                Log.e(TAG, "SponsorBlock direct request failed: " + urlStr, t);
+            } finally {
+                if (conn != null) {
+                    try { conn.disconnect(); } catch (Throwable ignored) {}
                 }
             }
         }
@@ -1748,12 +2049,28 @@ public class ProxyHelper {
         try {
             startWebServer(activity);
         } catch(Throwable ignored) {}
+        int keyCode = event.getKeyCode();
+        if (event.getAction() == KeyEvent.ACTION_UP &&
+                (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT ||
+                 keyCode == KeyEvent.KEYCODE_MEDIA_REWIND || keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD)) {
+            evaluateJs("window.__yttv_seek_guard_until=Date.now()+4000;");
+            return false;
+        }
         if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
-        return handleKeyDown(activity, event.getKeyCode(), event);
+        return handleKeyDown(activity, keyCode, event);
     }
 
     public static boolean handleKeyDown(Activity activity, int keyCode, KeyEvent event) {
         try {
+            if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT ||
+                    keyCode == KeyEvent.KEYCODE_MEDIA_REWIND || keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD) {
+                long now = System.currentTimeMillis();
+                if (now - sLastSeekGuardSentMs > 750L) {
+                    sLastSeekGuardSentMs = now;
+                    evaluateJs("window.__yttv_seek_guard_until=Date.now()+4000;");
+                }
+                return false;
+            }
             SharedPreferences prefs = activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
             boolean colorKeysEnabled = prefs.getBoolean(KEY_COLOR_KEYS_ENABLED, true);
 
@@ -1863,6 +2180,10 @@ public class ProxyHelper {
                 String currentProxy = prefs.getString(KEY_PROXY_URL, "");
                 boolean proxyEn = prefs.getBoolean(KEY_PROXY_ENABLED, true);
                 boolean sbEn = prefs.getBoolean(KEY_SB_ENABLED, true);
+                boolean votEn = prefs.getBoolean(KEY_VOT_ENABLED, false);
+                int votTranslationVolume = prefs.getInt(KEY_VOT_TRANSLATION_VOLUME, 100);
+                int votOriginalVolume = prefs.getInt(KEY_VOT_ORIGINAL_VOLUME, 18);
+                boolean votLively = prefs.getBoolean(KEY_VOT_LIVELY, false);
                 String quality = prefs.getString(KEY_PREFERRED_QUALITY, "auto");
                 float speed = prefs.getFloat(KEY_PLAYBACK_SPEED, 1.0f);
                 boolean colorKeys = prefs.getBoolean(KEY_COLOR_KEYS_ENABLED, true);
@@ -1883,6 +2204,11 @@ public class ProxyHelper {
                 final String[] items = new String[] {
                         isRu ? ("⚡ SOCKS5 Прокси: [" + proxyLabel + "]") : ("⚡ SOCKS5 Proxy: [" + proxyLabel + "]"),
                         isRu ? ("⏩ SponsorBlock: [" + (sbEn ? onStr : offStr) + "]") : ("⏩ SponsorBlock: [" + (sbEn ? onStr : offStr) + "]"),
+                        isRu ? ("🎙 Яндекс VOT: [" + (votEn ? onStr : offStr) + "]") : ("🎙 Yandex VOT: [" + (votEn ? onStr : offStr) + "]"),
+                        isRu ? "▶ Перевести текущее видео" : "▶ Translate current video",
+                        isRu ? ("🔊 Громкость перевода: [" + votTranslationVolume + "%]") : ("🔊 Translation volume: [" + votTranslationVolume + "%]"),
+                        isRu ? ("🎞 Громкость оригинала: [" + votOriginalVolume + "%]") : ("🎞 Original volume: [" + votOriginalVolume + "%]"),
+                        isRu ? ("🗣 Голос: [" + (votLively ? "Живой" : "Обычный") + "]") : ("🗣 Voice: [" + (votLively ? "Lively" : "Standard") + "]"),
                         isRu ? ("🎯 Категории SponsorBlock: [" + catCount + " из " + ALL_SB_CATEGORIES.length + "]") : ("🎯 SponsorBlock Categories: [" + catCount + " of " + ALL_SB_CATEGORIES.length + "]"),
                         isRu ? ("📺 Качество видео: [" + qLabel + "]") : ("📺 Video Quality: [" + qLabel + "]"),
                         isRu ? ("⚡ Скорость воспроизведения: [" + speed + "x]") : ("⚡ Playback Speed: [" + speed + "x]"),
@@ -1893,7 +2219,31 @@ public class ProxyHelper {
 
                 builder.setItems(items, this);
                 builder.setNegativeButton(isRu ? "Закрыть" : "Close", null);
-                builder.show();
+                final AlertDialog settingsDialog = builder.create();
+                settingsDialog.setOnKeyListener(new DialogInterface.OnKeyListener() {
+                    @Override
+                    public boolean onKey(DialogInterface dialog, int keyCode, KeyEvent event) {
+                        if (event.getAction() != KeyEvent.ACTION_DOWN ||
+                                (keyCode != KeyEvent.KEYCODE_DPAD_LEFT && keyCode != KeyEvent.KEYCODE_DPAD_RIGHT)) return false;
+                        ListView list = settingsDialog.getListView();
+                        int position = list != null ? list.getSelectedItemPosition() : -1;
+                        if (position != 4 && position != 5) return false;
+                        int delta = keyCode == KeyEvent.KEYCODE_DPAD_RIGHT ? 10 : -10;
+                        String key = position == 4 ? KEY_VOT_TRANSLATION_VOLUME : KEY_VOT_ORIGINAL_VOLUME;
+                        int fallback = position == 4 ? 100 : 18;
+                        int value = Math.max(0, Math.min(100, prefs.getInt(key, fallback) + delta));
+                        prefs.edit().putInt(key, value).apply();
+                        configureVot(prefs);
+                        View selected = list.getSelectedView();
+                        if (selected instanceof TextView) {
+                            ((TextView) selected).setText(position == 4
+                                    ? (isRu ? "🔊 Громкость перевода: [" : "🔊 Translation volume: [") + value + "%]"
+                                    : (isRu ? "🎞 Громкость оригинала: [" : "🎞 Original volume: [") + value + "%]");
+                        }
+                        return true;
+                    }
+                });
+                settingsDialog.show();
             } catch (Throwable t) {
                 Log.e(TAG, "Error showing settings dialog", t);
             }
@@ -1912,17 +2262,48 @@ public class ProxyHelper {
                     showSettingsDialog(activity);
                     break;
                 case 2:
-                    showSponsorBlockCategoriesDialog(activity);
-                    break;
-                case 3:
-                    cycleQuality(activity);
+                    boolean nv = !prefs.getBoolean(KEY_VOT_ENABLED, false);
+                    prefs.edit().putBoolean(KEY_VOT_ENABLED, nv).apply();
+                    VotManager.setEnabled(nv);
+                    updateWebClientConfig(prefs);
+                    if (!nv) evaluateJs("window.__yttv_vot_manual='';if(window.__yttv_vot_clear_status)window.__yttv_vot_clear_status();");
+                    Toast.makeText(activity, (isRu ? "Яндекс VOT: " : "Yandex VOT: ") + (nv ? "ON" : "OFF"), Toast.LENGTH_SHORT).show();
                     showSettingsDialog(activity);
                     break;
+                case 3:
+                    evaluateJs("if(window.__yttv_vot_activate)window.__yttv_vot_activate();");
+                    break;
                 case 4:
-                    cyclePlaybackSpeed(activity);
+                    Toast.makeText(activity, isRu ? "Используйте ← и →" : "Use ← and →", Toast.LENGTH_SHORT).show();
                     showSettingsDialog(activity);
                     break;
                 case 5:
+                    Toast.makeText(activity, isRu ? "Используйте ← и →" : "Use ← and →", Toast.LENGTH_SHORT).show();
+                    showSettingsDialog(activity);
+                    break;
+                case 6:
+                    boolean lively = !prefs.getBoolean(KEY_VOT_LIVELY, false);
+                    String token = prefs.getString(KEY_VOT_OAUTH_TOKEN, "");
+                    if (lively && (token == null || token.trim().isEmpty())) {
+                        Toast.makeText(activity, isRu ? "Живой голос требует авторизации Яндекса" : "Lively voice requires Yandex authorization", Toast.LENGTH_LONG).show();
+                    } else {
+                        prefs.edit().putBoolean(KEY_VOT_LIVELY, lively).apply();
+                        configureVot(prefs);
+                    }
+                    showSettingsDialog(activity);
+                    break;
+                case 7:
+                    showSponsorBlockCategoriesDialog(activity);
+                    break;
+                case 8:
+                    cycleQuality(activity);
+                    showSettingsDialog(activity);
+                    break;
+                case 9:
+                    cyclePlaybackSpeed(activity);
+                    showSettingsDialog(activity);
+                    break;
+                case 10:
                     boolean nk = !prefs.getBoolean(KEY_COLOR_KEYS_ENABLED, true);
                     prefs.edit().putBoolean(KEY_COLOR_KEYS_ENABLED, nk).apply();
                     String onStr = isRu ? "ВКЛ" : "ON";
@@ -1930,10 +2311,10 @@ public class ProxyHelper {
                     Toast.makeText(activity, (isRu ? "Цветные кнопки: " : "Color buttons: ") + (nk ? onStr : offStr), Toast.LENGTH_SHORT).show();
                     showSettingsDialog(activity);
                     break;
-                case 6:
+                case 11:
                     showLanguageDialog(activity);
                     break;
-                case 7:
+                case 12:
                     showWebHintDialog(activity);
                     break;
             }
@@ -2177,12 +2558,14 @@ public class ProxyHelper {
             float speed = prefs.getFloat(KEY_PLAYBACK_SPEED, 1.0f);
             String sbCatsJson = getSbCategoriesArray(prefs).toString();
             boolean isRu = isRussian(prefs);
+            boolean votEnabled = prefs.getBoolean(KEY_VOT_ENABLED, false);
 
             String js = "if(window.__yttv_update_config) { window.__yttv_update_config({" +
                     "sbEnabled:" + sbEnabled + "," +
                     "sbCategories:" + sbCatsJson + "," +
                     "quality:\"" + quality + "\"," +
                     "speed:" + speed + "," +
+                    "votEnabled:" + votEnabled + "," +
                     "isRu:" + isRu +
                     "}); }";
             evaluateJs(js);
@@ -2197,6 +2580,7 @@ public class ProxyHelper {
         String currentProxy = prefs.getString(KEY_PROXY_URL, "");
         boolean proxyEn = prefs.getBoolean(KEY_PROXY_ENABLED, true);
         boolean sbEn = prefs.getBoolean(KEY_SB_ENABLED, true);
+        boolean votEn = prefs.getBoolean(KEY_VOT_ENABLED, false);
         String quality = prefs.getString(KEY_PREFERRED_QUALITY, "auto");
         float speed = prefs.getFloat(KEY_PLAYBACK_SPEED, 1.0f);
         boolean colorKeys = prefs.getBoolean(KEY_COLOR_KEYS_ENABLED, true);
@@ -2270,6 +2654,12 @@ public class ProxyHelper {
         sb.append("<div class='chk-row'>");
         sb.append("<input type='checkbox' id='chk_sb' name='sb_enabled' value='1' ").append(sbEn ? "checked" : "").append(">");
         sb.append("<label for='chk_sb'><b>SponsorBlock:</b> ").append(isRu ? "включить автопропуск сегментов" : "enable auto-skipping segments").append("</label>");
+        sb.append("</div>");
+
+        // Yandex voice-over translation
+        sb.append("<div class='chk-row'>");
+        sb.append("<input type='checkbox' id='chk_vot' name='vot_enabled' value='1' ").append(votEn ? "checked" : "").append(">");
+        sb.append("<label for='chk_vot'><b>Яндекс VOT:</b> ").append(isRu ? "голосовой перевод EN → RU (тестовая версия)" : "voice translation EN → RU (test build)").append("</label>");
         sb.append("</div>");
 
         // SponsorBlock Categories

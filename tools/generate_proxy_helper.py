@@ -6,7 +6,7 @@ import subprocess
 import zipfile
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SDK_DIR = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or r"C:\Users\ChattyNB\AppData\Local\Android\Sdk"
+SDK_DIR = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or r"C:\Users\dieonfire\AppData\Local\Android\Sdk"
 BUILD_TOOLS_DIR = os.path.join(SDK_DIR, "build-tools")
 # Find latest build tools if available
 if os.path.exists(BUILD_TOOLS_DIR):
@@ -21,6 +21,7 @@ if os.path.exists(PLATFORMS_DIR):
     ANDROID_JAR = os.path.join(PLATFORMS_DIR, platform_versions[0], "android.jar") if platform_versions else os.path.join(PLATFORMS_DIR, "android-34", "android.jar")
 else:
     ANDROID_JAR = os.path.join(PLATFORMS_DIR, "android-34", "android.jar")
+ANDROID_JAR = os.environ.get("ANDROID_JAR_PATH") or ANDROID_JAR
 
 JAVAC = shutil.which("javac") or r"C:\Program Files\Eclipse Adoptium\jdk-21.0.11.10-hotspot\bin\javac.exe"
 D8 = shutil.which("d8") or os.path.join(BUILD_TOOLS, "d8.bat")
@@ -30,9 +31,9 @@ APKTOOL = os.path.join(BASE_DIR, "tools", "apktool_3.0.3.jar")
 
 def compile_java():
     print("=== 1. Compiling ProxyHelper.java with javac ===")
-    src_dir = os.path.join(BASE_DIR, "scratch", "src", "dev", "cobalt", "coat")
-    jni_src_dir = os.path.join(BASE_DIR, "scratch", "src", "org", "jni_zero")
-    bin_dir = os.path.join(BASE_DIR, "scratch", "bin")
+    src_dir = os.path.join(BASE_DIR, "src", "dev", "cobalt", "coat")
+    jni_src_dir = os.path.join(BASE_DIR, "src", "org", "jni_zero")
+    bin_dir = os.path.join(BASE_DIR, ".build", "bin")
     
     if os.path.exists(bin_dir):
         shutil.rmtree(bin_dir)
@@ -48,15 +49,16 @@ def compile_java():
         os.path.join(src_dir, "auo.java"),
         os.path.join(src_dir, "bnj.java"),
         os.path.join(jni_src_dir, "GEN_JNI.java"),
-        os.path.join(src_dir, "ProxyHelper.java")
+        os.path.join(src_dir, "ProxyHelper.java"),
+        os.path.join(src_dir, "VotManager.java")
     ]
     subprocess.check_call(cmd_javac)
     print("javac compilation successful.")
 
 def dex_classes():
     print("=== 2. Running d8 on ProxyHelper classes ===")
-    bin_dir = os.path.join(BASE_DIR, "scratch", "bin")
-    dex_dir = os.path.join(BASE_DIR, "scratch", "dex")
+    bin_dir = os.path.join(BASE_DIR, ".build", "bin")
+    dex_dir = os.path.join(BASE_DIR, ".build", "dex")
     if os.path.exists(dex_dir):
         shutil.rmtree(dex_dir)
     os.makedirs(dex_dir, exist_ok=True)
@@ -65,26 +67,26 @@ def dex_classes():
     class_files = [
         os.path.join(coat_bin, f)
         for f in os.listdir(coat_bin)
-        if f.startswith("ProxyHelper") and f.endswith(".class")
+        if (f.startswith("ProxyHelper") or f.startswith("VotManager")) and f.endswith(".class")
     ]
     if not class_files:
         raise RuntimeError("No ProxyHelper class files found to dex!")
 
-    cmd_d8 = [D8, "--output", dex_dir] + class_files
+    cmd_d8 = [D8, "--lib", ANDROID_JAR, "--output", dex_dir] + class_files
     subprocess.check_call(cmd_d8, shell=True)
     print(f"d8 finished: {len(class_files)} classes processed into classes.dex.")
 
 def apktool_disassemble():
     print("=== 3. Packaging dex and disassembling with apktool ===")
-    dex_dir = os.path.join(BASE_DIR, "scratch", "dex")
-    test_apk = os.path.join(BASE_DIR, "scratch", "test.apk")
+    dex_dir = os.path.join(BASE_DIR, ".build", "dex")
+    test_apk = os.path.join(BASE_DIR, ".build", "test.apk")
     if os.path.exists(test_apk):
         os.remove(test_apk)
 
     with zipfile.ZipFile(test_apk, "w") as zf:
         zf.write(os.path.join(dex_dir, "classes.dex"), "classes.dex")
 
-    test_out = os.path.join(BASE_DIR, "scratch", "test_out")
+    test_out = os.path.join(BASE_DIR, ".build", "test_out")
     if os.path.exists(test_out):
         shutil.rmtree(test_out)
 
@@ -94,20 +96,20 @@ def apktool_disassemble():
 
 def install_smali():
     print("=== 4. Post-processing smali and copying to work/decoded_modified ===")
-    test_out = os.path.join(BASE_DIR, "scratch", "test_out")
+    test_out = os.path.join(BASE_DIR, ".build", "test_out")
     generated_smali_dir = os.path.join(test_out, "smali", "dev", "cobalt", "coat")
     target_smali_dir = os.path.join(BASE_DIR, "work", "decoded_modified", "smali_classes2", "dev", "cobalt", "coat")
     os.makedirs(target_smali_dir, exist_ok=True)
 
     # Clean old ProxyHelper smali files
     for f in os.listdir(target_smali_dir):
-        if f.startswith("ProxyHelper"):
+        if f.startswith("ProxyHelper") or f.startswith("VotManager"):
             os.remove(os.path.join(target_smali_dir, f))
 
     # Copy new smali files with auo and bnj replacement
     copied_count = 0
     for f in os.listdir(generated_smali_dir):
-        if f.startswith("ProxyHelper"):
+        if f.startswith("ProxyHelper") or f.startswith("VotManager"):
             src_file = os.path.join(generated_smali_dir, f)
             dst_file = os.path.join(target_smali_dir, f)
             with open(src_file, "r", encoding="utf-8") as sf:
@@ -290,24 +292,197 @@ def patch_smali_hooks():
             ern_content = f.read()
 
         if "Ldev/cobalt/coat/ProxyHelper;->getCronetOptions" not in ern_content:
-            old_pattern = 'invoke-interface {v2}, Lers;->a()Ljava/lang/String;\n\n    move-result-object v3\n\n    invoke-static {v3}, Landroid/text/TextUtils;->isEmpty(Ljava/lang/CharSequence;)Z'
-            new_pattern = 'invoke-interface {v2}, Lers;->a()Ljava/lang/String;\n\n    move-result-object v3\n\n    invoke-static {v3}, Ldev/cobalt/coat/ProxyHelper;->getCronetOptions(Ljava/lang/String;)Ljava/lang/String;\n\n    move-result-object v3\n\n    invoke-static {v3}, Landroid/text/TextUtils;->isEmpty(Ljava/lang/CharSequence;)Z'
-            if old_pattern in ern_content:
-                ern_content = ern_content.replace(old_pattern, new_pattern)
-                with open(ern_path, "w", encoding="utf-8") as f:
-                    f.write(ern_content)
-                print("ern.smali Cronet hook added.")
+            old_pattern = 'invoke-interface {v2}, Lers;->a()Ljava/lang/String;'
+            marker = 'invoke-static {v3}, Landroid/text/TextUtils;->isEmpty(Ljava/lang/CharSequence;)Z'
+            hook = '    invoke-static {v3}, Ldev/cobalt/coat/ProxyHelper;->getCronetOptions(Ljava/lang/String;)Ljava/lang/String;\n\n    move-result-object v3\n\n'
+
+            start = ern_content.find(old_pattern)
+            if start != -1:
+                marker_pos = ern_content.find(marker, start)
+
+                if marker_pos != -1:
+                    ern_content = (
+                        ern_content[:marker_pos]
+                        + hook
+                        + ern_content[marker_pos:]
+                    )
+
+                    with open(ern_path, "w", encoding="utf-8") as f:
+                        f.write(ern_content)
+
+                    print("ern.smali Cronet hook added.")
+                else:
+                    print("Warning: TextUtils.isEmpty marker not found in ern.smali")
             else:
-                print("Warning: old_pattern not found in ern.smali")
+                print("Warning: Lers->a() pattern not found in ern.smali")
         else:
             print("ern.smali Cronet hook already present.")
+
+    # 5b. Suppress SecurityException from GmsClient package verification
+    cyh_path = os.path.join(BASE_DIR, "work", "decoded_modified", "smali_classes2", "cyh.smali")
+    if os.path.exists(cyh_path):
+        content = open(cyh_path, "r", encoding="utf-8").read()
+        old = """:catch_2
+    move-exception v0
+
+    .line 252
+    throw v0"""
+        new = """:catch_2
+    move-exception v0
+
+    .line 252
+    goto :goto_4"""
+        if old in content:
+            content = content.replace(old, new, 1)
+            open(cyh_path, "w", encoding="utf-8").write(content)
+            print("cyh.smali SecurityException handler patched.")
+        else:
+            print("cyh.smali SecurityException handler already patched or pattern not found.")
+    # 5. Additional owner patches from DIFF_FILE.patch
+    print("=== Applying additional owner smali patches ===")
+
+    # awf.smali -> ProxyHelper.applyProxy(Context)
+    awf_path = os.path.join(BASE_DIR, "work", "decoded_modified", "smali_classes2", "awf.smali")
+    if os.path.exists(awf_path):
+        with open(awf_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        hook = (
+            "    sget-object v0, Laus;->a:Landroid/content/Context;\n"
+            "    invoke-static {v0}, Ldev/cobalt/coat/ProxyHelper;->applyProxy(Landroid/content/Context;)V\n"
+        )
+
+        if "ProxyHelper;->applyProxy(Landroid/content/Context;)V" not in content:
+            marker = "    invoke-virtual {v0}, Lauo;->f()V\n"
+            if marker in content:
+                content = content.replace(marker, marker + hook, 1)
+                with open(awf_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                print("awf.smali patched.")
+            else:
+                print("Warning: awf marker not found.")
+
+    # dpv.smali -> capture native Cronet media URLs before request creation.
+    dpv_path = os.path.join(BASE_DIR, "work", "decoded_modified", "smali_classes2", "dpv.smali")
+    if os.path.exists(dpv_path):
+        with open(dpv_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        hook = "    invoke-static {v2}, Ldev/cobalt/coat/ProxyHelper;->captureMediaUrl(Ljava/lang/String;)V\n\n"
+        if "ProxyHelper;->captureMediaUrl(Ljava/lang/String;)V" not in content:
+            method_start = content.find(".method public static h(Lewb;")
+            marker = "    move-result-object v2\n"
+            marker_pos = content.find(marker, method_start)
+            if method_start >= 0 and marker_pos >= 0:
+                marker_pos += len(marker)
+                content = content[:marker_pos] + "\n" + hook + content[marker_pos:]
+                with open(dpv_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                print("dpv.smali native media URL hook added.")
+            else:
+                print("Warning: dpv media URL hook marker not found.")
+
+    # cmf.smali -> localhost
+    cmf_path = os.path.join(BASE_DIR, "work", "decoded_modified", "smali_classes2", "cmf.smali")
+    if os.path.exists(cmf_path):
+        with open(cmf_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        old = "https://pagead2.googlesyndication.com/pagead/gen_204?id=gmob-apps"
+        new = "http://127.0.0.1/"
+
+        if old in content:
+            content = content.replace(old, new, 1)
+            with open(cmf_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            print("cmf.smali patched.")
+
+    # TvRoot_Application.smali -> startWebServer(Context)
+    app_path = os.path.join(
+        BASE_DIR, "work", "decoded_modified",
+        "smali_classes2", "com", "google", "android", "apps",
+        "youtube", "tv", "application", "TvRoot_Application.smali"
+    )
+    if os.path.exists(app_path):
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        hook = "    invoke-static {p0}, Ldev/cobalt/coat/ProxyHelper;->startWebServer(Landroid/content/Context;)V\n\n"
+
+        if "ProxyHelper;->startWebServer(Landroid/content/Context;)V" not in content:
+            marker = "    .locals 9\n"
+            if marker in content:
+                content = content.replace(marker, marker + "\n" + hook, 1)
+                with open(app_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                print("TvRoot_Application.smali patched.")
+            else:
+                print("Warning: TvRoot_Application marker not found.")
+
+    # cyh.smali -> owner exception handling
+    cyh_path = os.path.join(BASE_DIR, "work", "decoded_modified", "smali_classes2", "cyh.smali")
+    if os.path.exists(cyh_path):
+        with open(cyh_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        old = ":catch_2\n    move-exception v0\n    throw v0"
+        new = ":catch_2\n    move-exception v0\n    goto :goto_4"
+
+        if old in content:
+            content = content.replace(old, new, 1)
+            with open(cyh_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            print("cyh.smali patched.")
+
+    # ern.smali -> owner ad-domain replacements
+    ern_path = os.path.join(BASE_DIR, "work", "decoded_modified", "smali_classes2", "ern.smali")
+    if os.path.exists(ern_path):
+        with open(ern_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        changed = False
+
+        old = 'const-string v10, "www.googleadservices.com"'
+        new = 'const-string v10, "127.0.0.1"'
+        if old in content:
+            content = content.replace(old, new, 1)
+            changed = True
+
+        old = 'const-string v8, "googleads.g.doubleclick.net"'
+        new = 'const-string v8, "127.0.0.1"'
+        if old in content:
+            content = content.replace(old, new, 1)
+            changed = True
+
+        if changed:
+            with open(ern_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            print("ern.smali owner ad-domain patches applied.")
+
+    # bdy.smali -> public mWebContents
+    bdy_path = os.path.join(BASE_DIR, "work", "decoded_modified", "smali_classes2", "bdy.smali")
+    if os.path.exists(bdy_path):
+        with open(bdy_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        old = ".field private mWebContents:"
+        new = ".field public mWebContents:"
+
+        if old in content:
+            content = content.replace(old, new, 1)
+            with open(bdy_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            print("bdy.smali patched.")
+
 
 def build_apk():
     print("=== 6. Building unsigned APK with apktool ===")
     unsigned_apk = os.path.join(BASE_DIR, "MODIFIED_FILE.unsigned.apk")
     if os.path.exists(unsigned_apk):
         os.remove(unsigned_apk)
-    cmd_apktool_b = ["java", "-jar", APKTOOL, "b", os.path.join(BASE_DIR, "work", "decoded_modified"), "-o", unsigned_apk]
+    framework_dir = os.path.join(BASE_DIR, ".build", "apktool-framework")
+    os.makedirs(framework_dir, exist_ok=True)
+    cmd_apktool_b = ["java", "-jar", APKTOOL, "b", "-p", framework_dir,
+                     os.path.join(BASE_DIR, "work", "decoded_modified"), "-o", unsigned_apk]
     subprocess.check_call(cmd_apktool_b)
     print("APK built successfully.")
 
